@@ -22,10 +22,15 @@ spec:
         app: vss-bridge
         version: v1
     spec:
+      # Pod-level security context
+      serviceAccountName: hostpath-sa
+      securityContext:
+        fsGroup: 1000
+      
       containers:
       - name: vss-bridge
         image: balamkumar/vss-chat-bridge:latest
-        imagePullPolicy: IfNotPresent
+        imagePullPolicy: Always
         ports:
         - name: http
           containerPort: 5000
@@ -35,6 +40,14 @@ spec:
         envFrom:
         - configMapRef:
             name: api-config
+        # File-backed asset id via hostPath mount (editable on host)
+        env:
+        - name: VSS_ASSET_ID_FILE
+          value: "/etc/vss/VSS_ASSET_ID"
+        volumeMounts:
+        - name: host-vss-config
+          mountPath: /etc/vss
+          readOnly: true
         
         # Resource requests and limits
         resources:
@@ -88,3 +101,8 @@ spec:
       # Restart policy
       restartPolicy: Always
       terminationGracePeriodSeconds: 30
+      volumes:
+      - name: host-vss-config
+        hostPath:
+          path: /etc/vss
+          type: DirectoryOrCreate
