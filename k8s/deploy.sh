@@ -22,6 +22,9 @@ kubectl apply -f k8s/namespace.yaml
 echo "🔐 Creating service account..."
 kubectl apply -f k8s/serviceaccount.yaml
 
+# Grant SCC that permits hostPath + any UID
+kubectl adm policy add-scc-to-user hostmount-anyuid -z hostpath-sa -n $NAMESPACE || true
+
 # Create ConfigMap
 echo "⚙️  Creating ConfigMap..."
 kubectl apply -f k8s/configmap.yaml
@@ -46,12 +49,12 @@ echo "🌐 Creating Service..."
 kubectl apply -f k8s/service.yaml
 
 # Create HPA
-echo "📊 Creating Horizontal Pod Autoscaler..."
-kubectl apply -f k8s/hpa.yaml
+#echo "📊 Creating Horizontal Pod Autoscaler..."
+#kubectl apply -f k8s/hpa.yaml
 
 # Create Network Policy
-echo "🔒 Creating Network Policy..."
-kubectl apply -f k8s/network-policy.yaml
+#echo "🔒 Creating Network Policy..."
+#kubectl apply -f k8s/network-policy.yaml
 
 echo ""
 echo "✅ Deployment completed successfully!"
