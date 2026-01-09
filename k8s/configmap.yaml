@@ -9,4 +9,4 @@ data:
   FLASK_HOST: "0.0.0.0"
   FLASK_PORT: "5000"
   NIM_ENDPOINT: "http://llama-33-nemotron-super-49b-v1-nim-service.apps.ocp-sno.edgedici.local/v1/chat/completions"
-  VSS_BACKEND: "http://localhost:8000"
+  VSS_BACKEND: "http://vss-service:8000"
