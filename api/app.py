@@ -90,7 +90,7 @@ def echo():
 
 
 # OpenAI Chat Completions compatible endpoint (mock)
-@app.route('/api/v2/chat/completions', methods=['POST'])
+@app.route('/api/v3/chat/completions', methods=['POST'])
 def chat_completions():
     """Proxy endpoint: forwards request JSON to a configured NIMs endpoint and returns response.
 
@@ -145,7 +145,7 @@ def chat_completions():
 
 
 # RAG Chat Completions endpoint (via VSS backend)
-@app.route('/api/v3/chat/completions', methods=['POST'])
+@app.route('/api/v2/chat/completions', methods=['POST'])
 def rag_chat_completions():
     """Proxy endpoint: forwards chat request to VSS backend for RAG-enabled responses.
 
@@ -354,7 +354,6 @@ def rag_chat_completions_streaming():
             )
             
             print(f"[DEBUG] VSS response status: {response.status_code}")
-            print(f"[DEBUG] VSS response headers: {dict(response.headers)}")
             
             if response.status_code >= 400:
                 error_msg = f"VSS backend error: {response.status_code}"
@@ -365,7 +364,6 @@ def rag_chat_completions_streaming():
                     error_msg += f" - {response.text[:200]}"
                 
                 print(f"[ERROR] {error_msg}")
-                
                 error_chunk = {
                     "id": chat_id,
                     "object": "chat.completion.chunk",
@@ -386,7 +384,7 @@ def rag_chat_completions_streaming():
             print(f"[DEBUG] Content-Type: {content_type}")
             
             if 'text/event-stream' in content_type or 'event-stream' in content_type:
-                # True SSE streaming
+                # True SSE streaming from VSS
                 print("[DEBUG] Processing as SSE stream")
                 try:
                     import sseclient
@@ -404,16 +402,15 @@ def rag_chat_completions_streaming():
                         except json.JSONDecodeError as e:
                             print(f"[ERROR] Failed to parse SSE chunk: {e}")
                             continue
+                    return
                 except ImportError:
                     print("[ERROR] sseclient-py not installed, falling back to JSON mode")
-                    # Fall through to JSON handling
             
-            # Handle as JSON response (VSS doesn't truly stream)
+            # Handle as JSON response - VSS returns complete response
             print("[DEBUG] Processing as JSON response, will simulate streaming")
             
-            # Read the full response
             vss_response = response.json()
-            print(f"[DEBUG] Got VSS response: {json.dumps(vss_response, indent=2)[:500]}...")
+            print(f"[DEBUG] Got VSS response with {len(json.dumps(vss_response))} chars")
             
             # Extract content from VSS response
             content = ""
@@ -429,9 +426,9 @@ def rag_chat_completions_streaming():
             if "usage" in vss_response:
                 usage = vss_response["usage"]
             
-            print(f"[DEBUG] Extracted content length: {len(content)}")
+            print(f"[DEBUG] Extracted content length: {len(content)} chars")
             
-            # Send initial chunk with role
+            # 1. Send initial chunk with role (OpenAI always sends this first)
             initial_chunk = {
                 "id": chat_id,
                 "object": "chat.completion.chunk",
@@ -439,16 +436,24 @@ def rag_chat_completions_streaming():
                 "model": model,
                 "choices": [{
                     "index": 0,
-                    "delta": {"role": "assistant"},
+                    "delta": {"role": "assistant", "content": ""},
                     "finish_reason": None
                 }]
             }
             yield f"data: {json.dumps(initial_chunk)}\n\n"
             
-            # Stream content in chunks (simulate streaming)
-            chunk_size = 50  # characters per chunk
-            for i in range(0, len(content), chunk_size):
-                chunk_text = content[i:i+chunk_size]
+            # 2. Stream content in smaller chunks (more OpenAI-like)
+            # Use word-level chunking for more natural streaming
+            words = content.split(' ')
+            chunk_size = 3  # 3-5 words per chunk is more realistic
+            
+            for i in range(0, len(words), chunk_size):
+                chunk_words = words[i:i+chunk_size]
+                chunk_text = ' '.join(chunk_words)
+                
+                # Add space at end if not the last chunk
+                if i + chunk_size < len(words):
+                    chunk_text += ' '
                 
                 content_chunk = {
                     "id": chat_id,
@@ -463,10 +468,10 @@ def rag_chat_completions_streaming():
                 }
                 yield f"data: {json.dumps(content_chunk)}\n\n"
                 
-                # Small delay to simulate streaming
-                time.sleep(0.01)
+                # Small delay to simulate realistic streaming speed
+                time.sleep(0.02)  # 20ms per chunk
             
-            # Send final chunk with finish_reason and usage
+            # 3. Send final chunk with finish_reason (no usage here for compatibility)
             final_chunk = {
                 "id": chat_id,
                 "object": "chat.completion.chunk",
@@ -478,10 +483,22 @@ def rag_chat_completions_streaming():
                     "finish_reason": "stop"
                 }]
             }
-            if usage:
-                final_chunk["usage"] = usage
-            
             yield f"data: {json.dumps(final_chunk)}\n\n"
+            
+            # 4. Optionally send usage in a separate chunk if stream_options.include_usage was true
+            # This follows OpenAI's new streaming format with usage
+            if usage and payload.get('stream_options', {}).get('include_usage'):
+                usage_chunk = {
+                    "id": chat_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_time,
+                    "model": model,
+                    "choices": [],
+                    "usage": usage
+                }
+                yield f"data: {json.dumps(usage_chunk)}\n\n"
+            
+            # 5. Send [DONE] signal
             yield "data: [DONE]\n\n"
             
             print(f"[DEBUG] Stream completed successfully")
@@ -496,24 +513,6 @@ def rag_chat_completions_streaming():
                 "choices": [{
                     "index": 0,
                     "delta": {"content": "Error: Request timeout"},
-                    "finish_reason": "error"
-                }]
-            }
-            yield f"data: {json.dumps(error_chunk)}\n\n"
-            yield "data: [DONE]\n\n"
-        
-        except requests.exceptions.RequestException as e:
-            print(f"[ERROR] Request error: {e}")
-            import traceback
-            traceback.print_exc()
-            error_chunk = {
-                "id": chat_id,
-                "object": "chat.completion.chunk",
-                "created": created_time,
-                "model": model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {"content": f"Error: Connection failed - {str(e)}"},
                     "finish_reason": "error"
                 }]
             }
