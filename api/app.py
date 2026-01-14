@@ -144,6 +144,73 @@ def chat_completions():
     return Response(resp.content, status=resp.status_code, headers=response_headers, content_type=resp.headers.get('Content-Type', 'application/json'))
 
 
+# OpenAI Chat Completions compatible endpoint with streaming support
+@app.route('/api/v4/chat/completions', methods=['POST'])
+def chat_completions_v4():
+    """Proxy endpoint: forwards request JSON to a configured NIMs endpoint and returns response.
+
+    Configure target with environment variable `NIM_ENDPOINT`.
+    If not set, returns 500.
+    Supports both streaming and non-streaming responses.
+    """
+    nim_endpoint = os.getenv('NIM_ENDPOINT')
+    if not nim_endpoint:
+        return jsonify({"error": "NIM_ENDPOINT not configured"}), 500
+
+    payload = request.get_json(silent=True)
+    if payload is None:
+        return jsonify({"error": "Invalid JSON payload"}), 400
+
+    # Check if streaming is requested
+    stream = payload.get('stream', False)
+
+    forward_headers = {}
+    for h, v in request.headers.items():
+        if h.lower() in ('host', 'content-length'):
+            continue
+        if h.lower() in ('accept', 'authorization', 'content-type') or h.lower().startswith('x-'):
+            forward_headers[h] = v
+
+    print(f"[DEBUG] NIM_ENDPOINT={nim_endpoint}, stream={stream}")
+    print(f"[DEBUG] Forward headers: {forward_headers}")
+    try:
+        print(f"[DEBUG] Payload (truncated): {json.dumps(payload)[:1000]}")
+    except Exception:
+        print("[DEBUG] Payload: <non-json or too large>")
+
+    try:
+        resp = requests.post(nim_endpoint, json=payload, headers=forward_headers, timeout=60, stream=stream)
+    except requests.exceptions.RequestException as e:
+        print(f"[DEBUG] Upstream request failed: {e}")
+        return jsonify({"error": "Failed to contact NIM endpoint", "details": str(e)}), 502
+
+    try:
+        print(f"[DEBUG] Upstream status: {resp.status_code}")
+        print(f"[DEBUG] Upstream headers: {dict(resp.headers)}")
+        if not stream:
+            print(f"[DEBUG] Upstream body (truncated): {resp.text[:1000]}")
+        else:
+            print("[DEBUG] Streaming response (body not shown)")
+    except Exception:
+        pass
+
+    excluded_resp_headers = ['content-encoding', 'transfer-encoding', 'connection']
+    response_headers = [(k, v) for k, v in resp.headers.items() if k.lower() not in excluded_resp_headers]
+
+    if stream:
+        # Stream the response back to client
+        return Response(
+            stream_with_context(resp.iter_content(chunk_size=1024, decode_unicode=True)),
+            status=resp.status_code,
+            headers=response_headers,
+            content_type=resp.headers.get('Content-Type', 'application/json'),
+            mimetype='text/event-stream'
+        )
+    else:
+        # Return non-streaming response
+        return Response(resp.content, status=resp.status_code, headers=response_headers, content_type=resp.headers.get('Content-Type', 'application/json'))
+
+
 # RAG Chat Completions endpoint (via VSS backend)
 @app.route('/api/v2/chat/completions', methods=['POST'])
 def rag_chat_completions():
