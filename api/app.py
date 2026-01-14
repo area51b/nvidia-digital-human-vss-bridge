@@ -211,6 +211,410 @@ def chat_completions_v4():
         return Response(resp.content, status=resp.status_code, headers=response_headers, content_type=resp.headers.get('Content-Type', 'application/json'))
 
 
+# Routing endpoint with whitelist-based routing
+@app.route('/api/v5/chat/completions', methods=['POST'])
+def chat_completions_v5_router():
+    """Intelligent routing endpoint that directs queries to appropriate backend based on content.
+    
+    Routes to /api/v1/chat/completions (VSS RAG backend) if query contains whitelisted keywords.
+    Routes to /api/v4/chat/completions (NIM endpoint) otherwise.
+    
+    Whitelisted keywords trigger RAG-enhanced responses from VSS backend.
+    Configure whitelist with environment variable `WHITELIST_KEYWORDS` (comma-separated).
+    """
+    # Get whitelist from environment variable
+    whitelist_env = os.getenv('WHITELIST_KEYWORDS', '')
+    whitelist = [kw.strip().lower() for kw in whitelist_env.split(',') if kw.strip()]
+    
+    if not whitelist:
+        print("[WARNING] WHITELIST_KEYWORDS not configured, defaulting to NIM endpoint")
+        # If no whitelist configured, default to v4 (NIM endpoint)
+        return forward_to_v4()
+    
+    # Get payload
+    payload = request.get_json(silent=True)
+    if payload is None:
+        return jsonify({"error": "Invalid JSON payload"}), 400
+    
+    # Extract user query from messages
+    messages = payload.get('messages', [])
+    user_query = ""
+    
+    if messages and isinstance(messages, list):
+        for msg in reversed(messages):
+            if msg.get('role') == 'user':
+                user_query = msg.get('content', '').lower()
+                break
+    
+    if not user_query:
+        print("[DEBUG] No user query found, routing to NIM endpoint")
+        return forward_to_v4()
+    
+    # Check if any whitelisted keyword is in the query
+    has_whitelist_keyword = any(keyword in user_query for keyword in whitelist)
+    
+    print(f"[DEBUG] Query: {user_query[:100]}...")
+    print(f"[DEBUG] Whitelist keywords: {whitelist}")
+    print(f"[DEBUG] Has whitelist keyword: {has_whitelist_keyword}")
+    
+    if has_whitelist_keyword:
+        print("[DEBUG] Routing to /api/v1/chat/completions (VSS RAG backend)")
+        return forward_to_v1(payload)
+    else:
+        print("[DEBUG] Routing to /api/v4/chat/completions (NIM endpoint)")
+        return forward_to_v4(payload)
+
+
+def forward_to_v1(payload=None):
+    """Forward request to VSS RAG backend (/api/v1/chat/completions)"""
+    if payload is None:
+        payload = request.get_json(silent=True)
+    
+    if payload is None:
+        return jsonify({"error": "Invalid JSON payload"}), 400
+    
+    # Get VSS backend configuration
+    vss_backend = os.getenv('VSS_BACKEND', 'http://localhost:8000')
+    asset_id = get_vss_asset_id(payload)
+    
+    if not asset_id:
+        return jsonify({"error": "VSS_ASSET_ID not configured and asset_id not in request"}), 400
+    
+    # Extract prompt from messages
+    messages = payload.get('messages', [])
+    if not messages or not isinstance(messages, list):
+        return jsonify({"error": "messages must be a non-empty list"}), 400
+    
+    # Find last user message
+    prompt = None
+    for msg in reversed(messages):
+        if msg.get('role') == 'user':
+            prompt = msg.get('content', '')
+            break
+    
+    if not prompt:
+        return jsonify({"error": "No user message found in messages"}), 400
+    
+    # Check if streaming is requested
+    stream = payload.get('stream', True)
+    model = 'cosmos-reason1'  # Override model for VSS RAG backend
+    temperature = payload.get('temperature')
+    max_tokens = payload.get('max_tokens')
+    top_p = payload.get('top_p')
+    top_k = payload.get('top_k')
+    seed = payload.get('seed')
+    chunk_duration = payload.get('chunk_duration')
+    enable_reasoning = payload.get('enable_reasoning', False)
+    
+    print(f"[DEBUG] VSS Chat: backend={vss_backend}, asset_id={asset_id}, model={model}, stream={stream}")
+    print(f"[DEBUG] Prompt: {prompt[:100]}...")
+    
+    # If streaming is not requested, use the non-streaming version
+    if not stream:
+        return handle_non_streaming_chat(
+            asset_id, model, prompt, vss_backend,
+            temperature, seed, top_p, top_k, max_tokens,
+            chunk_duration, enable_reasoning
+        )
+    
+    # Handle streaming request - reuse generate function logic
+    def generate():
+        """Generator function that yields SSE-formatted chunks"""
+        chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+        created_time = int(time.time())
+        
+        # Build request for VSS backend
+        req_json = {
+            "id": [asset_id] if isinstance(asset_id, str) else asset_id,
+            "model": model,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "messages": [{"content": str(prompt), "role": "user"}]
+        }
+        
+        if temperature is not None:
+            req_json["temperature"] = temperature
+        if seed is not None:
+            req_json["seed"] = seed
+        if top_p is not None:
+            req_json["top_p"] = top_p
+        if top_k is not None:
+            req_json["top_k"] = top_k
+        if max_tokens is not None:
+            req_json["max_tokens"] = max_tokens
+        if chunk_duration is not None:
+            req_json["chunk_duration"] = chunk_duration
+        if enable_reasoning:
+            req_json["enable_reasoning"] = enable_reasoning
+        
+        # Make request to VSS backend
+        vss_url = f"{vss_backend.rstrip('/')}/chat/completions"
+        print(f"[DEBUG] Making request to: {vss_url}")
+        
+        try:
+            response = requests.post(
+                vss_url, 
+                json=req_json, 
+                stream=True,
+                timeout=300
+            )
+            
+            print(f"[DEBUG] VSS response status: {response.status_code}")
+            
+            if response.status_code >= 400:
+                error_msg = f"VSS backend error: {response.status_code}"
+                try:
+                    error_details = response.json()
+                    error_msg += f" - {error_details}"
+                except:
+                    error_msg += f" - {response.text[:200]}"
+                
+                print(f"[ERROR] {error_msg}")
+                error_chunk = {
+                    "id": chat_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_time,
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": f"Error: {error_msg}"},
+                        "finish_reason": "error"
+                    }]
+                }
+                yield f"data: {json.dumps(error_chunk)}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+            
+            # Check if response is SSE or JSON
+            content_type = response.headers.get('content-type', '').lower()
+            print(f"[DEBUG] Content-Type: {content_type}")
+            
+            if 'text/event-stream' in content_type or 'event-stream' in content_type:
+                # True SSE streaming from VSS
+                print("[DEBUG] Processing as SSE stream")
+                try:
+                    client = sseclient.SSEClient(response)
+                    
+                    for event in client.events():
+                        if event.data == '[DONE]':
+                            yield "data: [DONE]\n\n"
+                            break
+                        
+                        try:
+                            vss_chunk = json.loads(event.data)
+                            openai_chunk = transform_vss_to_openai_chunk(vss_chunk, chat_id, created_time, model)
+                            yield f"data: {json.dumps(openai_chunk)}\n\n"
+                        except json.JSONDecodeError as e:
+                            print(f"[ERROR] Failed to parse SSE chunk: {e}")
+                            continue
+                    return
+                except ImportError:
+                    print("[ERROR] sseclient-py not installed, falling back to JSON mode")
+            
+            # Handle as JSON response - VSS returns complete response
+            print("[DEBUG] Processing as JSON response, will simulate streaming")
+            
+            vss_response = response.json()
+            print(f"[DEBUG] Got VSS response with {len(json.dumps(vss_response))} chars")
+            
+            # Extract content from VSS response
+            content = ""
+            usage = {}
+            
+            if "choices" in vss_response and len(vss_response["choices"]) > 0:
+                choice = vss_response["choices"][0]
+                if "message" in choice:
+                    content = choice["message"].get("content", "")
+                elif "text" in choice:
+                    content = choice["text"]
+            
+            if "usage" in vss_response:
+                usage = vss_response["usage"]
+            
+            print(f"[DEBUG] Extracted content length: {len(content)} chars")
+            
+            # 1. Send initial chunk with role
+            initial_chunk = {
+                "id": chat_id,
+                "object": "chat.completion.chunk",
+                "created": created_time,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": ""},
+                    "finish_reason": None
+                }]
+            }
+            yield f"data: {json.dumps(initial_chunk)}\n\n"
+            
+            # 2. Stream content in smaller chunks
+            words = content.split(' ')
+            chunk_size = 3
+            
+            for i in range(0, len(words), chunk_size):
+                chunk_words = words[i:i+chunk_size]
+                chunk_text = ' '.join(chunk_words)
+                
+                if i + chunk_size < len(words):
+                    chunk_text += ' '
+                
+                content_chunk = {
+                    "id": chat_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_time,
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": chunk_text},
+                        "finish_reason": None
+                    }]
+                }
+                yield f"data: {json.dumps(content_chunk)}\n\n"
+                time.sleep(0.02)
+            
+            # 3. Send final chunk
+            final_chunk = {
+                "id": chat_id,
+                "object": "chat.completion.chunk",
+                "created": created_time,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop"
+                }]
+            }
+            yield f"data: {json.dumps(final_chunk)}\n\n"
+            
+            # 4. Send usage if applicable
+            if usage and payload.get('stream_options', {}).get('include_usage'):
+                usage_chunk = {
+                    "id": chat_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_time,
+                    "model": model,
+                    "choices": [],
+                    "usage": usage
+                }
+                yield f"data: {json.dumps(usage_chunk)}\n\n"
+            
+            # 5. Send [DONE] signal
+            yield "data: [DONE]\n\n"
+            
+            print(f"[DEBUG] Stream completed successfully")
+        
+        except requests.exceptions.Timeout:
+            print("[ERROR] Request timeout")
+            error_chunk = {
+                "id": chat_id,
+                "object": "chat.completion.chunk",
+                "created": created_time,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": "Error: Request timeout"},
+                    "finish_reason": "error"
+                }]
+            }
+            yield f"data: {json.dumps(error_chunk)}\n\n"
+            yield "data: [DONE]\n\n"
+        
+        except Exception as e:
+            print(f"[ERROR] Streaming error: {e}")
+            import traceback
+            traceback.print_exc()
+            error_chunk = {
+                "id": chat_id,
+                "object": "chat.completion.chunk",
+                "created": created_time,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": f"Error: {str(e)}"},
+                    "finish_reason": "error"
+                }]
+            }
+            yield f"data: {json.dumps(error_chunk)}\n\n"
+            yield "data: [DONE]\n\n"
+    
+    # Return streaming response
+    return Response(
+        stream_with_context(generate()),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'X-Accel-Buffering': 'no',
+            'Connection': 'keep-alive',
+            'Content-Type': 'text/event-stream'
+        }
+    )
+
+
+def forward_to_v4(payload=None):
+    """Forward request to NIM endpoint (/api/v4/chat/completions)"""
+    if payload is None:
+        payload = request.get_json(silent=True)
+    
+    if payload is None:
+        return jsonify({"error": "Invalid JSON payload"}), 400
+    
+    nim_endpoint = os.getenv('NIM_ENDPOINT')
+    if not nim_endpoint:
+        return jsonify({"error": "NIM_ENDPOINT not configured"}), 500
+    
+    # Override model for NIM endpoint
+    payload['model'] = 'nvidia/llama-3.3-nemotron-super-49b-v1'
+    
+    # Check if streaming is requested
+    stream = payload.get('stream', False)
+    
+    forward_headers = {}
+    for h, v in request.headers.items():
+        if h.lower() in ('host', 'content-length'):
+            continue
+        if h.lower() in ('accept', 'authorization', 'content-type') or h.lower().startswith('x-'):
+            forward_headers[h] = v
+    
+    print(f"[DEBUG] NIM_ENDPOINT={nim_endpoint}, stream={stream}")
+    print(f"[DEBUG] Forward headers: {forward_headers}")
+    try:
+        print(f"[DEBUG] Payload (truncated): {json.dumps(payload)[:1000]}")
+    except Exception:
+        print("[DEBUG] Payload: <non-json or too large>")
+    
+    try:
+        resp = requests.post(nim_endpoint, json=payload, headers=forward_headers, timeout=60, stream=stream)
+    except requests.exceptions.RequestException as e:
+        print(f"[DEBUG] Upstream request failed: {e}")
+        return jsonify({"error": "Failed to contact NIM endpoint", "details": str(e)}), 502
+    
+    try:
+        print(f"[DEBUG] Upstream status: {resp.status_code}")
+        print(f"[DEBUG] Upstream headers: {dict(resp.headers)}")
+        if not stream:
+            print(f"[DEBUG] Upstream body (truncated): {resp.text[:1000]}")
+        else:
+            print("[DEBUG] Streaming response (body not shown)")
+    except Exception:
+        pass
+    
+    excluded_resp_headers = ['content-encoding', 'transfer-encoding', 'connection']
+    response_headers = [(k, v) for k, v in resp.headers.items() if k.lower() not in excluded_resp_headers]
+    
+    if stream:
+        # Stream the response back to client
+        return Response(
+            stream_with_context(resp.iter_content(chunk_size=1024, decode_unicode=True)),
+            status=resp.status_code,
+            headers=response_headers,
+            content_type=resp.headers.get('Content-Type', 'application/json'),
+            mimetype='text/event-stream'
+        )
+    else:
+        # Return non-streaming response
+        return Response(resp.content, status=resp.status_code, headers=response_headers, content_type=resp.headers.get('Content-Type', 'application/json'))
+
+
 # RAG Chat Completions endpoint (via VSS backend)
 @app.route('/api/v2/chat/completions', methods=['POST'])
 def rag_chat_completions():
