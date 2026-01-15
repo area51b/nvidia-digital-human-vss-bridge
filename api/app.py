@@ -279,12 +279,12 @@ def forward_to_v1(payload=None):
     if not asset_id:
         return jsonify({"error": "VSS_ASSET_ID not configured and asset_id not in request"}), 400
     
-    # Extract prompt from messages
+    # Extract messages (including system prompt)
     messages = payload.get('messages', [])
     if not messages or not isinstance(messages, list):
         return jsonify({"error": "messages must be a non-empty list"}), 400
     
-    # Find last user message
+    # Find last user message for logging
     prompt = None
     for msg in reversed(messages):
         if msg.get('role') == 'user':
@@ -307,13 +307,14 @@ def forward_to_v1(payload=None):
     
     print(f"[DEBUG] VSS Chat: backend={vss_backend}, asset_id={asset_id}, model={model}, stream={stream}")
     print(f"[DEBUG] Prompt: {prompt[:100]}...")
+    print(f"[DEBUG] Total messages: {len(messages)}")
     
     # If streaming is not requested, use the non-streaming version
     if not stream:
         return handle_non_streaming_chat(
             asset_id, model, prompt, vss_backend,
             temperature, seed, top_p, top_k, max_tokens,
-            chunk_duration, enable_reasoning
+            chunk_duration, enable_reasoning, messages
         )
     
     # Handle streaming request - use exact same logic as /api/v1/chat/completions
@@ -323,12 +324,13 @@ def forward_to_v1(payload=None):
         created_time = int(time.time())
         
         # Build request for VSS backend - CRITICAL: must include "stream": True
+        # Forward ALL messages including system prompt
         req_json = {
             "id": [asset_id] if isinstance(asset_id, str) else asset_id,
             "model": model,
             "stream": True,  # EXPLICIT stream flag
             "stream_options": {"include_usage": True},
-            "messages": [{"content": str(prompt), "role": "user"}]
+            "messages": messages  # Forward all messages with system prompt intact
         }
         
         if temperature is not None:
@@ -787,12 +789,13 @@ def rag_chat_completions_streaming():
         created_time = int(time.time())
         
         # Build request for VSS backend
+        # Forward ALL messages including system prompt
         req_json = {
             "id": [asset_id] if isinstance(asset_id, str) else asset_id,
             "model": model,
             "stream": True,
             "stream_options": {"include_usage": True},
-            "messages": [{"content": str(prompt), "role": "user"}]
+            "messages": messages  # Forward all messages with system prompt intact
         }
         
         if temperature is not None:
@@ -1056,7 +1059,7 @@ def transform_vss_to_openai_chunk(vss_chunk, chat_id, created_time, model):
 
 def handle_non_streaming_chat(asset_id, model, prompt, vss_backend,
                                temperature, seed, top_p, top_k, max_tokens,
-                               chunk_duration, enable_reasoning):
+                               chunk_duration, enable_reasoning, messages=None):
     """Handle non-streaming chat request"""
     from api.vss_client import call_vss_chat
     
