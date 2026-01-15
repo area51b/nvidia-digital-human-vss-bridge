@@ -264,7 +264,6 @@ def chat_completions_v5_router():
         print("[DEBUG] Routing to /api/v4/chat/completions (NIM endpoint)")
         return forward_to_v4(payload)
 
-
 def forward_to_v1(payload=None):
     """Forward request to VSS RAG backend (/api/v1/chat/completions)"""
     if payload is None:
@@ -317,17 +316,17 @@ def forward_to_v1(payload=None):
             chunk_duration, enable_reasoning
         )
     
-    # Handle streaming request - reuse generate function logic
+    # Handle streaming request - use exact same logic as /api/v1/chat/completions
     def generate():
         """Generator function that yields SSE-formatted chunks"""
         chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         created_time = int(time.time())
         
-        # Build request for VSS backend
+        # Build request for VSS backend - CRITICAL: must include "stream": True
         req_json = {
             "id": [asset_id] if isinstance(asset_id, str) else asset_id,
             "model": model,
-            "stream": True,
+            "stream": True,  # EXPLICIT stream flag
             "stream_options": {"include_usage": True},
             "messages": [{"content": str(prompt), "role": "user"}]
         }
@@ -548,7 +547,6 @@ def forward_to_v1(payload=None):
             'Content-Type': 'text/event-stream'
         }
     )
-
 
 def forward_to_v4(payload=None):
     """Forward request to NIM endpoint (/api/v4/chat/completions)"""
